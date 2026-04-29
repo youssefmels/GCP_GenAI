@@ -12,7 +12,7 @@ import requests
 
 from livereportagent.config import (
     TABLE_COMMITS, TABLE_TICKETS, TABLE_OWNERSHIP, TABLE_MEMBERS,
-    TABLE_MEMBER_REPOS, GITHUB_TOKEN,
+    TABLE_MEMBER_REPOS, GITHUB_TOKEN, BQ_PROJECT,
 )
 
 # --- Tool definitions ---
@@ -56,7 +56,7 @@ atlassian_mcp_toolset = McpToolset(
     ),
 )
 
-bq_client = bigquery.Client()
+bq_client = bigquery.Client(project=BQ_PROJECT)
 
 
 def get_commit_details(repo: str, commit_sha: str) -> str:
@@ -441,6 +441,70 @@ def lookup_user_repos(username: str) -> dict:
     return result
 
 
+def validate_user_repo(username: str, repository: str) -> dict:
+    """Validates that a user exists in the team and has access to a repository.
+
+    First checks if the username exists in the team_members table, then checks
+    if the provided repository is assigned to that user in team_members_repositories.
+
+    Args:
+        username: The GitHub username to validate.
+        repository: The repository name to check access for (e.g. 'owner/repo').
+
+    Returns:
+        A dict with validation results: whether the user exists, whether they
+        have access to the repo, and their list of assigned repositories.
+    """
+    result = {
+        "username": username,
+        "repository": repository,
+        "user_exists": False,
+        "repo_authorized": False,
+        "assigned_repositories": [],
+    }
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("uname", "STRING", username)]
+    )
+
+    # Check if user exists in team_members
+    member_query = f"""
+        SELECT full_name, email, role
+        FROM `{TABLE_MEMBERS}`
+        WHERE LOWER(username) = LOWER(@uname)
+        LIMIT 1
+    """
+    for row in bq_client.query(member_query, job_config=job_config).result():
+        result["user_exists"] = True
+        result["full_name"] = row.full_name
+        result["email"] = row.email
+        result["role"] = row.role
+
+    if not result["user_exists"]:
+        return result
+
+    # Check the user's assigned repositories
+    repo_query = f"""
+        SELECT repository FROM `{TABLE_MEMBER_REPOS}`
+        WHERE LOWER(username) = LOWER(@uname)
+    """
+    repos = [
+        row.repository
+        for row in bq_client.query(repo_query, job_config=job_config).result()
+    ]
+    result["assigned_repositories"] = repos
+
+    # Match full "owner/repo" or just the repo name part
+    repo_lower = repository.lower()
+    for r in repos:
+        if r.lower() == repo_lower or r.lower().endswith("/" + repo_lower):
+            result["repo_authorized"] = True
+            result["matched_repository"] = r
+            break
+
+    return result
+
+
 # --- Atlassian / JIRA Sync Agent ---
 
 atlassian_agent = Agent(
@@ -568,8 +632,8 @@ Your job is to build a **factual picture** of the blocker by performing these st
 
 Be factual and concise. Do not speculate — only report what the data shows.""",
     tools=[
-        bigquery_toolset, lookup_ownership, lookup_user_repos,
-        get_stale_tickets, correlate_commits_to_tickets,
+        lookup_ownership, lookup_user_repos,
+        validate_user_repo, get_stale_tickets, correlate_commits_to_tickets,
     ],
 )
 
@@ -703,7 +767,6 @@ def before_agent_callback(callback_context: CallbackContext) -> types.Content | 
         pass
     return None
 
-
 def after_agent_callback(callback_context: CallbackContext) -> types.Content | None:
     agent_name = callback_context.agent_name
     start = callback_context.state.get("_start_time", time.time())
@@ -736,15 +799,31 @@ You are the Project Delivery Accelerator. You help developers by:
 - Answering questions about the project (commits, file changes, PRs, ticket status).
 - Syncing data between GitHub, JIRA, and BigQuery.
 
+**IMPORTANT — User & Repository Validation (ALWAYS enforce this):**
+Whenever a user provides their username (and optionally a repository), you MUST first delegate
+to `investigator_agent` to call `validate_user_repo` (or `lookup_user_repos` if no repo is given yet)
+before doing anything else. Do NOT skip this step.
+
+- **Incorrect / unknown username:** If `user_exists` is `False`, STOP immediately and respond:
+  "Sorry, the username you provided was not found in our team directory. Please double-check
+  your username and try again." Do NOT proceed with any other actions.
+- **Unauthorized repository:** If the user provides a repository but `repo_authorized` is `False`,
+  STOP and respond: "You don't have access to that repository." Then list the repositories they
+  DO have access to from the validation result. Do NOT proceed with actions on that repository.
+- Once validated, ALWAYS use the full repository path from `matched_repository` (e.g. "owner/repo")
+  in all subsequent operations. NEVER ask the user for the repository owner — it comes from the database.
+- Only proceed with the actual request once the user AND repository are validated.
+
 Determine what the user needs and delegate to the right sub-agent:
 
 **For blocker resolution:**
-1. Parse the blocker — extract the developer's task, dependency, and reason.
-2. Delegate to `atlassian_agent` to fetch JIRA data.
-3. Delegate to `github_sync_agent` to sync commit history.
-4. Delegate to `investigator_agent` to cross-reference data and build a factual picture.
-5. Delegate to `notifier_agent` to notify the responsible person.
-6. Summarize the outcome back to the developer.
+1. Validate the user and repository first (see above).
+2. Parse the blocker — extract the developer's task, dependency, and reason.
+3. Delegate to `atlassian_agent` to fetch JIRA data.
+4. Delegate to `github_sync_agent` to sync commit history.
+5. Delegate to `investigator_agent` to cross-reference data and build a factual picture.
+6. Delegate to `notifier_agent` to notify the responsible person.
+7. Summarize the outcome back to the developer.
 
 **For commit/code queries** (e.g. "show me the last commit", "what files changed", "what did X change"):
 - Delegate to `code_analysis_agent` for detailed analysis of commits, diffs, and PRs.
