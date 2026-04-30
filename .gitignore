@@ -1,0 +1,28 @@
+# Virtual environment
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+node_modules/
+
+# ADK
+.adk
+*.db
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
