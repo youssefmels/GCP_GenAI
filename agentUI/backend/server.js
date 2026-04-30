@@ -6,6 +6,11 @@
  * ADK Cloud Run endpoints:
  *   POST /apps/{app_name}/users/{user_id}/sessions/{session_id}  → create session
  *   POST /run_sse  { app_name, user_id, session_id, new_message, streaming }  → stream
+ *
+ * Deduplication strategy:
+ *   ADK sends each text chunk TWICE — once with `modelVersion` (streaming chunk)
+ *   and once without (consolidated final event). We only forward chunks that
+ *   have `modelVersion` to avoid duplicates, from any agent.
  */
 
 import express from "express";
@@ -27,23 +32,24 @@ if (!isProd) {
 app.use(express.json());
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const AGENT_URL = (process.env.AGENT_URL ?? "https://livereport-agent-xmixiuqgua-ey.a.run.app").replace(/\/$/, "");
-const APP_NAME  = process.env.AGENT_APP_NAME ?? "livereportagent";
+const AGENT_URL = (
+  process.env.AGENT_URL ?? "https://livereport-agent-xmixiuqgua-ey.a.run.app"
+).replace(/\/$/, "");
+const APP_NAME = process.env.AGENT_APP_NAME ?? "livereportagent";
 
 console.log(`🔗  Agent : ${AGENT_URL}`);
 console.log(`📦  App   : ${APP_NAME}`);
 
-// ── Auth — gets an ID token valid for the Cloud Run service ──────────────────
+// ── Auth ──────────────────────────────────────────────────────────────────────
 const auth = new GoogleAuth();
+const isLocal = AGENT_URL.includes("localhost") || AGENT_URL.includes("127.0.0.1");
 
 async function getAuthHeaders() {
+  if (isLocal) return {};
   try {
-    // For Cloud Run → use ID token (not access token)
     const client = await auth.getIdTokenClient(AGENT_URL);
-    const headers = await client.getRequestHeaders();
-    return headers; // { Authorization: "Bearer <id_token>" }
+    return await client.getRequestHeaders();
   } catch {
-    // Fallback to access token (works if caller has roles/run.invoker)
     const client = await auth.getClient();
     const { token } = await client.getAccessToken();
     return { Authorization: `Bearer ${token}` };
@@ -55,22 +61,22 @@ const sessionMap = new Map();
 
 async function getOrCreateSession(userId) {
   if (sessionMap.has(userId)) {
-    const sid = sessionMap.get(userId);
-    console.log(`[session] Reusing ${sid}`);
-    return sid;
+    console.log(`[session] Reusing ${sessionMap.get(userId)}`);
+    return sessionMap.get(userId);
   }
 
   const sessionId = `session-${userId.slice(0, 8)}-${Date.now()}`;
   console.log(`[session] Creating ${sessionId}`);
 
-  const url = `${AGENT_URL}/apps/${APP_NAME}/users/${userId}/sessions/${sessionId}`;
   const authHeaders = await getAuthHeaders();
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { ...authHeaders, "Content-Type": "application/json" },
-    body: JSON.stringify({}),
-  });
+  const res = await fetch(
+    `${AGENT_URL}/apps/${APP_NAME}/users/${userId}/sessions/${sessionId}`,
+    {
+      method: "POST",
+      headers: { ...authHeaders, "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    }
+  );
 
   if (!res.ok && res.status !== 409) {
     const text = await res.text();
@@ -85,19 +91,13 @@ async function getOrCreateSession(userId) {
 // ── Extract text from an ADK event ───────────────────────────────────────────
 function extractText(event) {
   try {
-    const parts = event?.content?.parts ?? [];
-    return parts.filter((p) => typeof p.text === "string").map((p) => p.text).join("");
+    return (event?.content?.parts ?? [])
+      .filter((p) => typeof p.text === "string")
+      .map((p) => p.text)
+      .join("");
   } catch {
     return "";
   }
-}
-
-function isFinalEvent(event) {
-  const role = event?.content?.role;
-  const hasFunctionCall = (event?.content?.parts ?? []).some(
-    (p) => p.function_call || p.function_response
-  );
-  return role === "model" && !hasFunctionCall;
 }
 
 // ── POST /api/chat ────────────────────────────────────────────────────────────
@@ -114,13 +114,10 @@ app.post("/api/chat", async (req, res) => {
   }
 
   const payload = {
-    app_name:   APP_NAME,
-    user_id:    userId,
+    app_name: APP_NAME,
+    user_id: userId,
     session_id: agentSessionId,
-    new_message: {
-      role:  "user",
-      parts: [{ text: message }],
-    },
+    new_message: { role: "user", parts: [{ text: message }] },
     streaming: true,
   };
 
@@ -128,7 +125,6 @@ app.post("/api/chat", async (req, res) => {
 
   try {
     const authHeaders = await getAuthHeaders();
-
     const upstream = await fetch(`${AGENT_URL}/run_sse`, {
       method: "POST",
       headers: { ...authHeaders, "Content-Type": "application/json" },
@@ -170,13 +166,26 @@ app.post("/api/chat", async (req, res) => {
           const jsonStr = trimmed.startsWith("data:") ? trimmed.slice(5).trim() : trimmed;
           if (!jsonStr || jsonStr === "[DONE]") continue;
 
-          console.log(`[event]`, jsonStr.slice(0, 200));
-
           try {
             const event = JSON.parse(jsonStr);
-            const text = extractText(event);
-            if (text) {
-              res.write(`data: ${JSON.stringify({ text, isFinal: isFinalEvent(event), author: event.author ?? "" })}\n\n`);
+            const author = event.author ?? "";
+            const role = event?.content?.role;
+            const parts = event?.content?.parts ?? [];
+            const hasFunctionCall = parts.some(p => p.function_call || p.function_response);
+
+            // ADK sends each chunk twice: once with modelVersion (streaming),
+            // once without (consolidated). Only forward the streaming ones.
+            const isStreamingChunk = !!event.modelVersion;
+            const isModelText = role === "model" && !hasFunctionCall;
+
+            if (isStreamingChunk && isModelText) {
+              const text = extractText(event);
+              if (text) {
+                console.log(`[forward] author=${author} text="${text.slice(0, 60)}"`);
+                res.write(`data: ${JSON.stringify({ text, author })}\n\n`);
+              }
+            } else {
+              console.log(`[skip] author=${author} role=${role} streaming=${isStreamingChunk}`);
             }
           } catch {
             console.warn(`[event] Could not parse:`, jsonStr.slice(0, 100));
@@ -218,4 +227,4 @@ if (process.env.SERVE_STATIC === "true") {
 const PORT = process.env.PORT ?? 3001;
 app.listen(PORT, () => {
   console.log(`✅  Backend running on http://localhost:${PORT}`);
-})
+});
